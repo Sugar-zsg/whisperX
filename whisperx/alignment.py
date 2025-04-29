@@ -344,6 +344,15 @@ def align(
                 "words": sentence_words,
             })
 
+            # 该代码业务暂时用不到，没有做相应优化
+            '''
+            if return_char_alignments:
+                curr_chars = curr_chars[["char", "start", "end", "score"]]
+                curr_chars.fillna(-1, inplace=True)
+                curr_chars = curr_chars.to_dict("records")
+                curr_chars = [{key: val for key, val in char.items() if val != -1} for char in curr_chars]
+                aligned_subsegments[-1]["chars"] = curr_chars
+            '''
 
         aligned_subsegments = pd.DataFrame(aligned_subsegments)
         aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
