@@ -115,6 +115,7 @@ def align(
     """
     Align phoneme recognition predictions to known transcription.
     """   
+
     if not torch.is_tensor(audio):
         if isinstance(audio, str):
             audio = load_audio(audio)
@@ -225,7 +226,6 @@ def align(
             )
         else:
             lengths = None
-        
         waveform_segment = waveform_segment.to(torch.float16)
         with torch.inference_mode():
             if model_type == "torchaudio":
