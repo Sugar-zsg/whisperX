@@ -288,8 +288,8 @@ def align(
             {
                 "index": i,
                 "char": ch["char"],
-                "start": ch["start"],
-                "end": ch["end"],
+                "start": ch["start"] if ch["start"] is not None else 0.0,
+                "end": ch["end"] if ch["end"] is not None else 0.0,
                 "score": ch["score"],
                 "word-idx": ch["word-idx"],
                 "sentence-idx": None  # 新增字段
