@@ -288,8 +288,8 @@ def align(
             {
                 "index": i,
                 "char": ch["char"],
-                "start": ch["start"] if ch["start"] is not None else 0.0,
-                "end": ch["end"] if ch["end"] is not None else 0.0,
+                "start": ch["start"],
+                "end": ch["end"],
                 "score": ch["score"],
                 "word-idx": ch["word-idx"],
                 "sentence-idx": None  # 新增字段
@@ -304,9 +304,11 @@ def align(
             for ch in curr_chars:
                 ch["sentence-idx"] = sdx
             sentence_text = text[sstart:send]
-            sentence_start = min(ch["start"] for ch in curr_chars)
+            valid_starts = [ch["start"] for ch in curr_chars if ch["start"] is not None]
+            sentence_start = min(valid_starts) if valid_starts else None  # 处理全None情况
             end_chars = [ch for ch in curr_chars if ch["char"] != ' ']
-            sentence_end = max(ch["end"] for ch in end_chars) if end_chars else 0 
+            valid_ends = [ch["end"] for ch in end_chars if ch["end"] is not None] if end_chars else []
+            sentence_end = max(valid_ends) if valid_ends else None  # 处理全None情况
             word_dict = {}
             for ch in curr_chars:
                 word_idx = ch["word-idx"]
@@ -322,9 +324,14 @@ def align(
                 word_text = "".join(ch["char"] for ch in word_chars).strip()
                 if not word_text:
                     continue
-                word_start = min(ch["start"] for ch in filtered_chars)
-                word_end = max(ch["end"] for ch in filtered_chars)
-                word_score = round(sum(ch["score"] for ch in filtered_chars) / len(filtered_chars), 3)
+                valid_starts = [ch["start"] for ch in filtered_chars if ch["start"] is not None]
+                valid_ends = [ch["end"] for ch in filtered_chars if ch["end"] is not None]
+    
+                valid_scores = [ch["score"] for ch in filtered_chars if ch["score"] is not None]
+    
+                word_start = min(valid_starts) if valid_starts else None
+                word_end = max(valid_ends) if valid_ends else None
+                word_score = round(sum(valid_scores)/len(valid_scores), 3) if valid_scores else None
 
                 # -1 indicates unalignable 
                 word_segment = {"word": word_text}
