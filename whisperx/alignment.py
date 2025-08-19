@@ -85,8 +85,8 @@ def load_align_model(language_code: str, device: str, model_name: Optional[str] 
         align_dictionary = {c.lower(): i for i, c in enumerate(labels)}
     else:
         try:
-            processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=model_dir)
-            align_model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=model_dir)
+            processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=model_dir, torch_dtype=torch.float16)
+            align_model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=model_dir, torch_dtype=torch.float16)
         except Exception as e:
             print(e)
             print(f"Error loading model from huggingface, check https://huggingface.co/models for finetuned wav2vec2.0 models")
@@ -227,6 +227,7 @@ def align(
         else:
             lengths = None
             
+        waveform_segment = waveform_segment.to(torch.float16)
         with torch.inference_mode():
             if model_type == "torchaudio":
                 emissions, _ = model(waveform_segment.to(device), lengths=lengths)
@@ -282,43 +283,64 @@ def align(
                 word_idx += 1
             elif cdx == len(text) - 1 or text[cdx+1] == " ":
                 word_idx += 1
-            
-        char_segments_arr = pd.DataFrame(char_segments_arr)
+
+        char_segments = [
+            {
+                "index": i,
+                "char": ch["char"],
+                "start": ch["start"],
+                "end": ch["end"],
+                "score": ch["score"],
+                "word-idx": ch["word-idx"],
+                "sentence-idx": None  # 新增字段
+            }
+            for i, ch in enumerate(char_segments_arr)
+        ]
 
         aligned_subsegments = []
         # assign sentence_idx to each character index
-        char_segments_arr["sentence-idx"] = None
         for sdx, (sstart, send) in enumerate(segment["sentence_spans"]):
-            curr_chars = char_segments_arr.loc[(char_segments_arr.index >= sstart) & (char_segments_arr.index <= send)]
-            char_segments_arr.loc[(char_segments_arr.index >= sstart) & (char_segments_arr.index <= send), "sentence-idx"] = sdx
-        
+            curr_chars = [ch for ch in char_segments if sstart <= ch["index"] <= send]
+            for ch in curr_chars:
+                ch["sentence-idx"] = sdx
             sentence_text = text[sstart:send]
-            sentence_start = curr_chars["start"].min()
-            end_chars = curr_chars[curr_chars["char"] != ' ']
-            sentence_end = end_chars["end"].max()
+            valid_starts = [ch["start"] for ch in curr_chars if ch["start"] is not None]
+            sentence_start = min(valid_starts) if valid_starts else None  # 处理全None情况
+            end_chars = [ch for ch in curr_chars if ch["char"] != ' ']
+            valid_ends = [ch["end"] for ch in end_chars if ch["end"] is not None] if end_chars else []
+            sentence_end = max(valid_ends) if valid_ends else None  # 处理全None情况
+            word_dict = {}
+            for ch in curr_chars:
+                word_idx = ch["word-idx"]
+                if word_idx not in word_dict:
+                    word_dict[word_idx] = []
+                word_dict[word_idx].append(ch)
             sentence_words = []
-
-            for word_idx in curr_chars["word-idx"].unique():
-                word_chars = curr_chars.loc[curr_chars["word-idx"] == word_idx]
-                word_text = "".join(word_chars["char"].tolist()).strip()
-                if len(word_text) == 0:
+            for word_idx, word_chars in word_dict.items():
+                filtered_chars = [ch for ch in word_chars if ch["char"] != ' ']
+                if not filtered_chars:
                     continue
 
-                # dont use space character for alignment
-                word_chars = word_chars[word_chars["char"] != " "]
-
-                word_start = word_chars["start"].min()
-                word_end = word_chars["end"].max()
-                word_score = round(word_chars["score"].mean(), 3)
+                word_text = "".join(ch["char"] for ch in word_chars).strip()
+                if not word_text:
+                    continue
+                valid_starts = [ch["start"] for ch in filtered_chars if ch["start"] is not None]
+                valid_ends = [ch["end"] for ch in filtered_chars if ch["end"] is not None]
+    
+                valid_scores = [ch["score"] for ch in filtered_chars if ch["score"] is not None]
+    
+                word_start = min(valid_starts) if valid_starts else None
+                word_end = max(valid_ends) if valid_ends else None
+                word_score = round(sum(valid_scores)/len(valid_scores), 3) if valid_scores else None
 
                 # -1 indicates unalignable 
                 word_segment = {"word": word_text}
 
-                if not np.isnan(word_start):
+                if word_start is not None:
                     word_segment["start"] = word_start
-                if not np.isnan(word_end):
+                if word_end is not None:
                     word_segment["end"] = word_end
-                if not np.isnan(word_score):
+                if word_score is not None:
                     word_segment["score"] = word_score
 
                 sentence_words.append(word_segment)
@@ -330,12 +352,15 @@ def align(
                 "words": sentence_words,
             })
 
+            # 该代码业务暂时用不到，没有做相应优化
+            '''
             if return_char_alignments:
                 curr_chars = curr_chars[["char", "start", "end", "score"]]
                 curr_chars.fillna(-1, inplace=True)
                 curr_chars = curr_chars.to_dict("records")
                 curr_chars = [{key: val for key, val in char.items() if val != -1} for char in curr_chars]
                 aligned_subsegments[-1]["chars"] = curr_chars
+            '''
 
         aligned_subsegments = pd.DataFrame(aligned_subsegments)
         aligned_subsegments["start"] = interpolate_nans(aligned_subsegments["start"], method=interpolate_method)
@@ -363,6 +388,38 @@ source: https://pytorch.org/tutorials/intermediate/forced_alignment_with_torchau
 def get_trellis(emission, tokens, blank_id=0):
     num_frame = emission.size(0)
     num_tokens = len(tokens)
+    device = emission.device
+    dtype = emission.dtype
+
+    # Precompute emissions for blank and tokens to avoid repeated indexing
+    blank_emissions = emission[:, blank_id].contiguous()  # (num_frame,)
+    token_emissions = emission[:, tokens].contiguous()    # (num_frame, num_tokens)
+
+    # Initialize trellis with proper device/dtype
+    trellis = torch.empty((num_frame + 1, num_tokens + 1), device=device, dtype=dtype)
+
+    # Initialize starting state
+    trellis[0, 0] = 0
+    trellis[1:, 0] = torch.cumsum(blank_emissions, dim=0)  # 修正使用blank_id对应的列
+
+    # Initialize invalid paths
+    trellis[0, 1:] = -float('inf')
+    if num_frame >= num_tokens:
+        trellis[-num_tokens:, 0] = float('inf')
+    else:
+        trellis[(num_frame + 1 - num_tokens):, 0] = float('inf')
+
+    # Vectorized frame processing
+    for t in range(num_frame):
+        stay_scores = trellis[t, 1:] + blank_emissions[t]  # (num_tokens,)
+        move_scores = trellis[t, :-1] + token_emissions[t] # (num_tokens,)
+        trellis[t+1, 1:] = torch.maximum(stay_scores, move_scores)
+
+    return trellis
+'''
+def get_trellis(emission, tokens, blank_id=0):
+    num_frame = emission.size(0)
+    num_tokens = len(tokens)
 
     # Trellis has extra diemsions for both time axis and tokens.
     # The extra dim for tokens represents <SoS> (start-of-sentence)
@@ -381,13 +438,14 @@ def get_trellis(emission, tokens, blank_id=0):
             trellis[t, :-1] + emission[t, tokens],
         )
     return trellis
+'''
 
 @dataclass
 class Point:
     token_index: int
     time_index: int
     score: float
-
+'''
 def backtrack(trellis, emission, tokens, blank_id=0):
     # Note:
     # j and t are indices for trellis, which has extra dimensions
@@ -423,7 +481,57 @@ def backtrack(trellis, emission, tokens, blank_id=0):
         # failed
         return None
     return path[::-1]
+'''
+def backtrack(trellis, emission, tokens, blank_id=0):
+    # Convert tokens to a list for faster access if it's a tensor
+    if isinstance(tokens, torch.Tensor):
+        tokens = tokens.tolist()
 
+    j = trellis.size(1) - 1
+    t_start = torch.argmax(trellis[:, j]).item()
+
+    # Early termination if not enough time steps to backtrack
+    if t_start < j:
+        return None
+
+    path = []
+    current_j = j  # Track current token position dynamically
+
+    # Loop from t_start down to 1 (inclusive)
+    for t in range(t_start, 0, -1):
+        original_j = current_j  # Capture j before potential modification
+        time_step = t - 1  # Emission index
+
+        # Precompute emission values to avoid repeated indexing
+        emission_blank = emission[time_step, blank_id]
+        if original_j > 0:
+            token_index = tokens[original_j - 1]
+            emission_token = emission[time_step, token_index]
+        else:
+            emission_token = -float('inf')  # Invalid if no token
+
+        # Calculate scores
+        stayed = trellis[t-1, original_j] + emission_blank
+        changed = trellis[t-1, original_j-1] + emission_token if original_j > 0 else -float('inf')
+
+        # Determine action and update current_j
+        if original_j > 0 and changed > stayed:
+            prob = emission_token.exp().item()
+            current_j -= 1
+        else:
+            prob = emission_blank.exp().item()
+
+        # Append the point with original_j (before decrement)
+        path.append(Point(original_j-1, time_step, prob))
+
+        # Early exit if reached the start of the token sequence
+        if current_j == 0:
+            break
+    else:
+        # Loop exhausted without reaching token start
+        return None
+
+    return path[::-1]
 # Merge the labels
 @dataclass
 class Segment:
